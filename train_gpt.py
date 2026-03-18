@@ -19,13 +19,19 @@ import uuid
 import zlib
 from pathlib import Path
 
+_t_boot = time.perf_counter()
 import numpy as np
 import sentencepiece as spm
+_t_pre_torch = time.perf_counter()
 import torch
+_t_post_torch = time.perf_counter()
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+_t_imports_done = time.perf_counter()
+if int(os.environ.get("RANK", "0")) == 0:
+    print(f"TIMING import_numpy_sp:{(_t_pre_torch-_t_boot)*1000:.0f}ms import_torch:{(_t_post_torch-_t_pre_torch)*1000:.0f}ms import_rest:{(_t_imports_done-_t_post_torch)*1000:.0f}ms total:{(_t_imports_done-_t_boot)*1000:.0f}ms", flush=True)
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -823,6 +829,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    _t_model_start = time.perf_counter()
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -840,8 +847,14 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    _t_pre_compile = time.perf_counter()
+    log0(f"TIMING model_init:{(_t_pre_compile-_t_model_start)*1000:.0f}ms")
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    _t_post_compile = time.perf_counter()
+    log0(f"TIMING torch_compile_call:{(_t_post_compile-_t_pre_compile)*1000:.0f}ms")
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    _t_post_ddp = time.perf_counter()
+    log0(f"TIMING ddp_wrap:{(_t_post_ddp-_t_post_compile)*1000:.0f}ms")
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -938,6 +951,7 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        _t_warmup_loop_start = time.perf_counter()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -951,7 +965,8 @@ def main() -> None:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                _t_ws = time.perf_counter()
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps} elapsed:{(_t_ws-_t_warmup_loop_start)*1000:.0f}ms")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -959,6 +974,13 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if os.environ.get("TIMING_ONLY") == "1":
+        _t_end = time.perf_counter()
+        log0(f"TIMING total_startup:{(_t_end-_t_boot)*1000:.0f}ms")
+        if distributed:
+            dist.destroy_process_group()
+        sys.exit(0)
 
     # -----------------------------
     # MAIN TRAINING LOOP
