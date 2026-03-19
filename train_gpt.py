@@ -579,8 +579,11 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_q._ortho_init = True
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_k._ortho_init = True
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v._ortho_init = True
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -615,6 +618,7 @@ class MLP(nn.Module):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
+        self.fc._ortho_init = True
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
@@ -702,6 +706,9 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            if isinstance(module, nn.Linear) and getattr(module, "_ortho_init", False):
+                with torch.no_grad():
+                    module.weight.copy_(zeropower_via_newtonschulz5(module.weight, steps=10))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
