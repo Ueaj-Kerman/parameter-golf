@@ -39,6 +39,7 @@ All experiments run on 2026-03-18/19, comparing against the 9L/512d tied-embeddi
 | 11 | Canon v1 (pre-act, k4) | canon-layers | 1.2840 | — | +0.0551 | 2416 | 15.5MB | 75ms/step, wrong placement |
 | 12 | Embed RMS opt LR=0.05 | embed-optimizer | 1.2538 | 2.1067 | +0.0249 | 13020 | 15.8MB | Default LR too high |
 | 13 | Untied embeds 9L (**over cap**) | untied-embeds | 1.2168 | 2.0522 | -0.0121 | 13012 | **16.3MB** | Invalid, over 16MB |
+| 14 | Scalar scale (+ LR=0.01) | scalar-scale | 1.2189 | 2.0581 | -0.0100 | 13244 | 15.9MB | Per-channel is better by 0.0014 |
 
 ---
 
@@ -111,6 +112,16 @@ Issues encountered:
 - **Untied 8L + low LR (0.03)**: SSL converged (1.0→0.71). 3-min was marginally better (1.2609 vs 1.2619) but 10-min washed out to 1.2299 (noise).
 
 Key learning: SSL on embeddings needs untied weights and conservative LR. May need more steps or different architecture to show benefit.
+
+### 7. Scalar vs Per-Channel Scale (scalar-scale)
+Replaced per-channel `attn_scale` and `mlp_scale` (512-element vectors) with single scalars.
+
+With TIED_EMBED_LR=0.01:
+- Per-channel: 1.2175
+- Scalar: 1.2189
+- Δ: +0.0014 (~3x noise floor)
+
+Per-channel scales are earning their keep at this model size.
 
 ---
 
