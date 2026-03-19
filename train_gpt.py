@@ -150,9 +150,15 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    # Reshape >2D tensors (e.g. conv weights) to 2D for Newton-Schulz
+                    orig_shape = g.shape
+                    if g.ndim > 2:
+                        g = g.reshape(g.size(0), -1)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    if len(orig_shape) > 2:
+                        g = g.reshape(orig_shape)
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -603,6 +609,27 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class GatedCausalConv(nn.Module):
+    def __init__(self, dim: int, hidden: int = 768, kernel_size: int = 3):
+        super().__init__()
+        self.linear_up = CastedLinear(dim, hidden, bias=False)
+        self.conv_gate = nn.Conv1d(dim, hidden, kernel_size, bias=False, padding=kernel_size - 1)
+        self.down_proj = CastedLinear(hidden, dim, bias=False)
+        self.down_proj._zero_init = True
+        self.causal_trim = kernel_size - 1
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, T, D)
+        up = self.linear_up(x)  # (B, T, H)
+        h = x.transpose(1, 2)  # (B, D, T)
+        gate = self.conv_gate(h)
+        if self.causal_trim > 0:
+            gate = gate[..., :-self.causal_trim]
+        gate = gate.transpose(1, 2)  # (B, T, H)
+        y = F.silu(up) * gate  # SwiGLU-style gating (B, T, H)
+        return self.down_proj(y)
+
+
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
@@ -667,8 +694,12 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        # First "layer" is a gated causal conv, remaining num_layers-1 are transformer blocks
+        self.conv_layer = GatedCausalConv(model_dim, hidden=1280, kernel_size=3)
+        self.conv_norm = RMSNorm()
+        num_blocks = num_layers - 1
+        self.num_encoder_layers = num_blocks // 2
+        self.num_decoder_layers = num_blocks - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -681,7 +712,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_blocks)
             ]
         )
         self.final_norm = RMSNorm()
@@ -700,6 +731,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        # Gated causal conv as first layer
+        x = x + self.conv_layer(self.conv_norm(x))
         x0 = x
         skips: list[Tensor] = []
 
@@ -861,6 +894,12 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # Conv layer: conv weights (ndim>=2) go to Muon (reshaped to 2D internally), scalars to Adam
+    for name, p in base_model.conv_layer.named_parameters():
+        if p.ndim >= 2:
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
