@@ -174,8 +174,38 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
+class EmbedRMSOpt(torch.optim.Optimizer):
+    """Momentum SGD with row-wise RMS scaling for embedding matrices."""
+    def __init__(self, params, lr: float, momentum: float = 0.9, eps: float = 1e-8):
+        super().__init__(params, dict(lr=lr, momentum=momentum, eps=eps))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            eps = group["eps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                # Row-wise RMS of momentum buffer
+                row_rms = buf.square().mean(dim=-1, keepdim=True).sqrt().add_(eps)
+                p.add_(buf * (lr / row_rms), alpha=-1.0)
+        return loss
+
+
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -295,7 +325,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,output_scale",
     ).split(",")
     if pattern
 )
@@ -691,6 +721,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.output_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -721,11 +752,11 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight) * self.output_scale.to(dtype=x.dtype)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(x) * self.output_scale.to(dtype=x.dtype)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -874,12 +905,12 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.output_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = EmbedRMSOpt(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
+        lr=token_lr,
+        momentum=args.beta1,
     )
     optimizer_muon = Muon(
         matrix_params,
@@ -1053,6 +1084,15 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+
+        # Embedding row RMS regularization: clamp rows with RMS >= 1.25 back to unit RMS
+        with torch.no_grad():
+            emb_w = base_model.tok_emb.weight
+            row_rms = emb_w.square().mean(dim=-1, keepdim=True).sqrt()
+            mask = row_rms >= 1.25
+            if mask.any():
+                emb_w.div_(torch.where(mask, row_rms, torch.ones_like(row_rms)))
+
         zero_grad_all()
 
         step += 1
