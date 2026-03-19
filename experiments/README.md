@@ -40,6 +40,10 @@ All experiments run on 2026-03-18/19, comparing against the 9L/512d tied-embeddi
 | 12 | Embed RMS opt LR=0.05 | embed-optimizer | 1.2538 | 2.1067 | +0.0249 | 13020 | 15.8MB | Default LR too high |
 | 13 | Untied embeds 9L (**over cap**) | untied-embeds | 1.2168 | 2.0522 | -0.0121 | 13012 | **16.3MB** | Invalid, over 16MB |
 | 14 | Scalar scale (+ LR=0.01) | scalar-scale | 1.2189 | 2.0581 | -0.0100 | 13244 | 15.9MB | Per-channel is better by 0.0014 |
+| 15 | **GatedCausalConv h=1280 untied 7blk** | worktree-ssl | **1.2247** | 2.1038 | **-0.0042** | 14258 | 15.99MB | Best conv config, ~4% faster/step |
+| 16 | GatedCausalConv h=768 tied 8blk | worktree-ssl | 1.2269 | — | -0.0020 | 13537 | 15.83MB | Borderline, within noise |
+| 17 | NorMuon (per-row 2nd moment norm) | worktree-normuon | — | — | — | — | — | Not run (code-only) |
+| 18 | SPlus optimizer (SVD eigenbasis) | worktree-svdopt | — | — | — | — | — | Not run (code-only) |
 
 ---
 
@@ -122,6 +126,44 @@ With TIED_EMBED_LR=0.01:
 - Δ: +0.0014 (~3x noise floor)
 
 Per-channel scales are earning their keep at this model size.
+
+### 8. GatedCausalConv (worktree-ssl)
+Replaced first transformer block with a `GatedCausalConv` module: linear up-proj + causal Conv1d gate + SwiGLU gating + zero-init down-proj. Conv weights handled by Muon (reshaped 3D to 2D for Newton-Schulz).
+
+Key findings:
+- Muon is critical for conv weights -- Adam performed ~0.075 bpb worse
+- Conv layer saves ~2ms/step (~4% faster) vs attention+MLP block
+- Best 3-min: h=768 → 1.2584 quant bpb (baseline 1.2619)
+- Best 10-min: h=1280 untied 7blk → **1.2247** quant bpb (baseline 1.2289, Δ=-0.0042)
+- h=768 tied 8blk: 1.2269 quant (Δ=-0.0020, borderline)
+- wandb runs: `conv_h1280_untied_7blk_full` (val_loss 2.1038), `gated_conv_linup_h768_nosc_muon_8L_512d_full` (val_loss 2.0765)
+
+Iteration history: sigmoid gate+Adam (bad) → SwiGLU+Muon (matched baseline) → linear up+conv gate h=768 (best 3-min) → h=1280 untied (best 10-min). Speed win but not a clear standalone quality win.
+
+### 9. NorMuon -- Per-Row Second Moment Normalization (worktree-normuon)
+Modified Muon optimizer to add per-row second moment normalization after Newton-Schulz orthogonalization. Added `beta2` (default 0.95) and `eps` (default 1e-10) hyperparameters.
+
+Algorithm change in Muon step:
+1. After Newton-Schulz orthogonalization, compute per-row mean of squared values
+2. Track EMA of squared values via `lerp_` with `beta2`
+3. Normalize each row by `sqrt(second_moment)`
+4. Rescale to preserve overall gradient norm (ratio of pre/post normalization norms)
+
+Replaces the original `max(1, rows/cols)**0.5` scale correction. Idea: adaptively normalize per-neuron update magnitudes while keeping the orthogonalized direction. No training runs recorded.
+
+### 10. SPlus Optimizer -- SVD Eigenbasis (worktree-svdopt)
+Replaced Muon entirely with SPlus (Frans, Levine, Abbeel 2025), a stable whitening optimizer that projects momentum into a periodically-recomputed eigenbasis, applies sign updates, and projects back.
+
+Key changes:
+- Tracks left and right covariance matrices (`g @ g.T`, `g.T @ g`) with EMA (`b2=0.999`)
+- Periodic eigendecomposition via `torch.linalg.eigh` every `inverse_every=100` steps
+- Projects momentum into eigenbasis, applies `sign()`, projects back
+- Shape-aware LR scaling: `lr * 2/(m+n)` for 2D params, `lr * 0.001` for scalars
+- EMA weight averaging with `eval_mode()`/`train_mode()` for validation
+- Removed Newton-Schulz iteration entirely, removed `torch.compile` of NS function
+- Default LR raised to 0.2 (from Muon's 0.04), removed momentum warmup
+
+No training runs recorded. Large refactor (107 insertions, 86 deletions).
 
 ---
 
