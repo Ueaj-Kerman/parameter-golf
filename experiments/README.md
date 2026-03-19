@@ -22,28 +22,34 @@ All experiments run on 2026-03-18/19, comparing against the 9L/512d tied-embeddi
 
 ---
 
-## Experiment Results (10-minute, 8xH100)
+## All Results (10-minute, 8xH100, sorted by quantized val_bpb)
 
-| # | Experiment | Branch | quantized val_bpb | val_loss | Δ vs baseline | Steps | Size | Verdict |
-|---|-----------|--------|-------------------|----------|---------------|-------|------|---------|
-| 1 | **Adam embed LR=0.01** | adam-embed-lr-sweep | **1.2175** | 2.0577 | **-0.0114** | 13112 | 15.9MB | **WINNER** |
-| 2 | Embed RMS opt LR=0.005 | embed-optimizer | 1.2204 | 2.0653 | -0.0085 | 13224 | 15.8MB | Good but Adam LR fix is simpler |
-| 3 | Embed RMS opt LR=0.01 | embed-optimizer | 1.2235 | 2.0651 | -0.0054 | 13020 | 15.8MB | Superseded by LR=0.005 |
-| 4 | Canon v3 (matmul, LR=0.005) | canon-layers | 1.2276 | — | -0.0013 | ~10900 | 15.9MB | Marginal, 55ms/step overhead |
-| 5 | Untied embeds 8L | untied-embeds | 1.2285 | 2.1113 | -0.0004 | 14659 | 14.6MB | Noise, layer loss cancels gain |
-| 6 | Ortho-init (NS on Q/K/V/fc) | ortho-init | 1.2301 | 2.0639 | +0.0012 | 12488 | 15.9MB | No effect |
-| 7 | SSL pretrain (tied, norm pres) | ssl-pretrain | 1.2337 | 2.0767 | +0.0048 | 13166 | 15.8MB | Hurts with tied embeds |
-| 8 | SSL untied 8L (LR=0.03) | ssl-pretrain | 1.2299 | 2.1139 | +0.0010 | 14549 | 14.6MB | Noise |
-| 9 | SSL untied 8L (LR=1.8, diverged) | ssl-pretrain | 1.2770 | — | +0.0481 | — | 14.6MB | LR way too high |
-| 10 | Canon v2 (post-act, k8, conv1d) | canon-layers | 1.2399 | — | +0.0110 | 7499 | 15.9MB | 78ms/step killed it |
-| 11 | Canon v1 (pre-act, k4) | canon-layers | 1.2840 | — | +0.0551 | 2416 | 15.5MB | 75ms/step, wrong placement |
-| 12 | Embed RMS opt LR=0.05 | embed-optimizer | 1.2538 | 2.1067 | +0.0249 | 13020 | 15.8MB | Default LR too high |
-| 13 | Untied embeds 9L (**over cap**) | untied-embeds | 1.2168 | 2.0522 | -0.0121 | 13012 | **16.3MB** | Invalid, over 16MB |
-| 14 | Scalar scale (+ LR=0.01) | scalar-scale | 1.2189 | 2.0581 | -0.0100 | 13244 | 15.9MB | Per-channel is better by 0.0014 |
-| 15 | **GatedCausalConv h=1280 untied 7blk** | worktree-ssl | **1.2247** | 2.1038 | **-0.0042** | 14258 | 15.99MB | Best conv config, ~4% faster/step |
-| 16 | GatedCausalConv h=768 tied 8blk | worktree-ssl | 1.2269 | — | -0.0020 | 13537 | 15.83MB | Borderline, within noise |
-| 17 | NorMuon (per-row 2nd moment norm) | worktree-normuon | — | — | — | — | — | Not run (code-only) |
-| 18 | SPlus optimizer (SVD eigenbasis) | worktree-svdopt | — | — | — | — | — | Not run (code-only) |
+| # | Experiment | Branch | quantized val_bpb | Δ vs baseline | Steps | Size | Verdict |
+|---|-----------|--------|-------------------|---------------|-------|------|---------|
+| 13 | Untied embeds 9L | untied-embeds | 1.2168 | -0.0121 | 13012 | **16.3MB** | **INVALID (over 16MB cap)** |
+| — | | | | | | | |
+| 1 | **Adam embed LR=0.01** | adam-embed-lr-sweep | **1.2175** | **-0.0114** | 13112 | 15.9MB | **WINNER — zero code changes** |
+| 14 | Scalar scale (+ LR=0.01) | scalar-scale | 1.2189 | -0.0100 | 13244 | 15.9MB | Per-channel is better by 0.0014 |
+| 2 | Embed RMS opt LR=0.005 | embed-optimizer | 1.2204 | -0.0085 | 13224 | 15.8MB | Good but Adam LR fix is simpler |
+| 3 | Embed RMS opt LR=0.01 | embed-optimizer | 1.2235 | -0.0054 | 13020 | 15.8MB | Superseded by LR=0.005 |
+| 15 | GatedCausalConv h=1280 untied 7blk | worktree-ssl | 1.2247 | -0.0042 | 14258 | 15.99MB | Best conv config, ~4% faster/step |
+| 16 | GatedCausalConv h=768 tied 8blk | worktree-ssl | 1.2269 | -0.0020 | 13537 | 15.83MB | Borderline, within noise |
+| 4 | Canon v3 (matmul, LR=0.005) | canon-layers | 1.2276 | -0.0013 | ~10900 | 15.9MB | Marginal, 55ms/step overhead |
+| 5 | Untied embeds 8L | untied-embeds | 1.2285 | -0.0004 | 14659 | 14.6MB | Noise, layer loss cancels gain |
+| — | **Baseline (seed 7)** | main | **1.2286** | — | 12527 | 15.9MB | |
+| — | **Baseline (seed 1337)** | main | **1.2287** | — | 12527 | 15.9MB | |
+| — | **Baseline mean ± std** | main | **1.2289 ± 0.0004** | — | | | |
+| — | **Baseline (seed 42)** | main | **1.2293** | — | 13112 | 15.9MB | |
+| 8 | SSL untied 8L (LR=0.03) | ssl-pretrain | 1.2299 | +0.0010 | 14549 | 14.6MB | Noise |
+| 6 | Ortho-init (NS on Q/K/V/fc) | ortho-init | 1.2301 | +0.0012 | 12488 | 15.9MB | No effect |
+| 7 | SSL pretrain (tied, norm pres) | ssl-pretrain | 1.2337 | +0.0048 | 13166 | 15.8MB | Hurts with tied embeds |
+| 10 | Canon v2 (post-act, k8, conv1d) | canon-layers | 1.2399 | +0.0110 | 7499 | 15.9MB | 78ms/step killed it |
+| 12 | Embed RMS opt LR=0.05 | embed-optimizer | 1.2538 | +0.0249 | 13020 | 15.8MB | Default LR too high |
+| 9 | SSL untied 8L (LR=1.8, diverged) | ssl-pretrain | 1.2770 | +0.0481 | — | 14.6MB | LR way too high |
+| 11 | Canon v1 (pre-act, k4) | canon-layers | 1.2840 | +0.0551 | 2416 | 15.5MB | 75ms/step, wrong placement |
+| — | | | | | | | |
+| 17 | NorMuon (per-row 2nd moment norm) | worktree-normuon | — | — | — | — | Not run (code-only) |
+| 18 | SPlus optimizer (SVD eigenbasis) | worktree-svdopt | — | — | — | — | Not run (code-only) |
 
 ---
 
