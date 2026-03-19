@@ -34,6 +34,7 @@ All experiments run on 2026-03-18/19, comparing against the 9L/512d tied-embeddi
 | 3 | Embed RMS opt LR=0.01 | embed-optimizer | 1.2235 | -0.0054 | 13020 | 15.8MB | Superseded by LR=0.005 |
 | 15 | GatedCausalConv h=1280 untied 7blk | worktree-ssl | 1.2247 | -0.0042 | 14258 | 15.99MB | Best conv config, ~4% faster/step |
 | 16 | GatedCausalConv h=768 tied 8blk | worktree-ssl | 1.2269 | -0.0020 | 13537 | 15.83MB | Borderline, within noise |
+| 17 | NorMuon (per-row 2nd moment norm) | worktree-normuon | 1.2270 | -0.0019 | — | — | Borderline, zero overhead |
 | 4 | Canon v3 (matmul, LR=0.005) | canon-layers | 1.2276 | -0.0013 | ~10900 | 15.9MB | Marginal, 55ms/step overhead |
 | 5 | Untied embeds 8L | untied-embeds | 1.2285 | -0.0004 | 14659 | 14.6MB | Noise, layer loss cancels gain |
 | — | **Baseline (seed 7)** | main | **1.2286** | — | 12527 | 15.9MB | |
@@ -48,8 +49,7 @@ All experiments run on 2026-03-18/19, comparing against the 9L/512d tied-embeddi
 | 9 | SSL untied 8L (LR=1.8, diverged) | ssl-pretrain | 1.2770 | +0.0481 | — | 14.6MB | LR way too high |
 | 11 | Canon v1 (pre-act, k4) | canon-layers | 1.2840 | +0.0551 | 2416 | 15.5MB | 75ms/step, wrong placement |
 | — | | | | | | | |
-| 17 | NorMuon (per-row 2nd moment norm) | worktree-normuon | — | — | — | — | Not run (code-only) |
-| 18 | SPlus optimizer (SVD eigenbasis) | worktree-svdopt | — | — | — | — | Not run (code-only) |
+| 18 | SPlus optimizer (SVD eigenbasis) | worktree-svdopt | — | — | — | — | 10-min run in progress |
 
 ---
 
@@ -155,7 +155,9 @@ Algorithm change in Muon step:
 3. Normalize each row by `sqrt(second_moment)`
 4. Rescale to preserve overall gradient norm (ratio of pre/post normalization norms)
 
-Replaces the original `max(1, rows/cols)**0.5` scale correction. Idea: adaptively normalize per-neuron update magnitudes while keeping the orthogonalized direction. No training runs recorded.
+Replaces the original `max(1, rows/cols)**0.5` scale correction. Idea: adaptively normalize per-neuron update magnitudes while keeping the orthogonalized direction.
+
+10-min result: **1.2270 quantized val_bpb** (-0.0019 vs baseline). Borderline meaningful, zero speed/memory overhead. Trends in the right direction.
 
 ### 10. SPlus Optimizer -- SVD Eigenbasis (worktree-svdopt)
 Replaced Muon entirely with SPlus (Frans, Levine, Abbeel 2025), a stable whitening optimizer that projects momentum into a periodically-recomputed eigenbasis, applies sign updates, and projects back.
@@ -169,7 +171,7 @@ Key changes:
 - Removed Newton-Schulz iteration entirely, removed `torch.compile` of NS function
 - Default LR raised to 0.2 (from Muon's 0.04), removed momentum warmup
 
-No training runs recorded. Large refactor (107 insertions, 86 deletions).
+10-min run in progress. Large refactor (107 insertions, 86 deletions).
 
 ---
 
