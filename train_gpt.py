@@ -83,6 +83,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    canon_lr = float(os.environ.get("CANON_LR", 0.005))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -523,7 +524,7 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+            if (param.ndim < 2 or param.ndim == 3 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 
@@ -636,18 +637,34 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
+        # Depthwise causal conv as raw weight matrices — avoids conv1d transpose overhead.
+        # Shape: (dim, kernel_size). Zero-init = identity at start (since it's added as residual).
+        self.canon_a_w = nn.Parameter(torch.zeros(dim, 4))
+        self.canon_c_w = nn.Parameter(torch.zeros(dim, 4))
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
+    @staticmethod
+    def _apply_canon(w: Tensor, x: Tensor) -> Tensor:
+        # Depthwise causal conv via shift-multiply-sum. x: (B, T, D), w: (D, K).
+        # Avoids nn.Conv1d transpose overhead — pure pointwise ops that fuse well.
+        K = w.size(1)
+        xp = F.pad(x, (0, 0, K, 0))  # (B, K+T, D) — left-pad time dim
+        wt = w.to(dtype=x.dtype)
+        # Unrolled sum of shifted views weighted by per-channel kernel weights
+        return sum(xp[:, K - k : K - k + x.size(1), :] * wt[:, k] for k in range(K))
+
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_in = self.attn_norm(x)
+        attn_out = self.attn(attn_in + self._apply_canon(self.canon_a_w, attn_in))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_in = self.mlp_norm(x)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_in + self._apply_canon(self.canon_c_w, mlp_in))
         return x
 
 
@@ -700,7 +717,7 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+            if isinstance(module, (nn.Linear, nn.Conv1d)) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -862,15 +879,22 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    canon_params = [
+        p for name, p in block_named_params if "canon_" in name
+    ]
+    canon_param_ids = {id(p) for p in canon_params}
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        and id(p) not in canon_param_ids
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        and id(p) not in canon_param_ids
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -895,7 +919,13 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_canon = torch.optim.Adam(
+        [{"params": canon_params, "lr": args.canon_lr, "base_lr": args.canon_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_canon]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -913,7 +943,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} canon_lr:{args.canon_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
