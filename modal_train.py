@@ -114,6 +114,7 @@ TRAIN_ENV_KEYS = [
     "MLP_MULT", "TIE_EMBEDDINGS", "ROPE_BASE", "LOGIT_SOFTCAP",
     "EMBED_LR", "HEAD_LR", "TIED_EMBED_LR", "MATRIX_LR", "SCALAR_LR",
     "MUON_MOMENTUM", "VAL_LOSS_EVERY", "TRAIN_LOG_EVERY",
+    "SSL_STEPS", "SSL_EMBED_LR_MULT", "SSL_CONV_LR", "SSL_HIDDEN", "SSL_KERNEL",
 ]
 
 
@@ -166,6 +167,8 @@ def train(env_overrides: dict[str, str] | None = None):
         "TOKENIZER_PATH": str(tokenizer_path),
         "MAX_WALLCLOCK_SECONDS": "60",
         "TORCHINDUCTOR_CACHE_DIR": f"{VOLUME_PATH}/torch_cache",
+        "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "60",
+        "NCCL_TIMEOUT": "60",
         **env_overrides,
     }
     if compile_only:

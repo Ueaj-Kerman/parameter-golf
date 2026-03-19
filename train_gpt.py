@@ -67,12 +67,12 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -91,6 +91,13 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # SSL embedding pre-training
+    ssl_steps = int(os.environ.get("SSL_STEPS", 100))
+    ssl_embed_lr_mult = float(os.environ.get("SSL_EMBED_LR_MULT", 0.05))
+    ssl_conv_lr = float(os.environ.get("SSL_CONV_LR", 1e-3))
+    ssl_hidden = int(os.environ.get("SSL_HIDDEN", 2048))
+    ssl_kernel = int(os.environ.get("SSL_KERNEL", 6))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -623,6 +630,28 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class GatedCausalConv(nn.Module):
+    def __init__(self, dim: int, hidden: int = 2048, kernel_size: int = 6):
+        super().__init__()
+        self.conv_up = nn.Conv1d(dim, hidden, kernel_size, bias=False, padding=kernel_size - 1)
+        self.conv_gate = nn.Conv1d(dim, hidden, kernel_size, bias=False, padding=kernel_size - 1)
+        self.down_proj = CastedLinear(hidden, dim, bias=False)
+        self.down_proj._zero_init = True
+        self.causal_trim = kernel_size - 1
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = x.transpose(1, 2)
+        up = self.conv_up(h)
+        gate = self.conv_gate(h)
+        if self.causal_trim > 0:
+            up = up[..., :-self.causal_trim]
+            gate = gate[..., :-self.causal_trim]
+        up = up.transpose(1, 2)
+        gate = gate.transpose(1, 2)
+        y = F.silu(up) * gate
+        return self.down_proj(y)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -923,10 +952,80 @@ def main() -> None:
     log0(f"seed:{args.seed}")
 
     # -----------------------------
-    # DATA LOADER & MODEL WARMUP
+    # SSL EMBEDDING PRE-TRAINING
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if args.ssl_steps > 0:
+        _t_ssl_start = time.perf_counter()
+        ssl_conv = GatedCausalConv(
+            dim=args.model_dim, hidden=args.ssl_hidden, kernel_size=args.ssl_kernel
+        ).to(device).bfloat16()
+        for m in ssl_conv.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        ssl_norm = RMSNorm().to(device)
+
+        ssl_base_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+        ssl_embed_lr = ssl_base_lr * args.ssl_embed_lr_mult
+        ssl_opt_embed = torch.optim.Adam(
+            [base_model.tok_emb.weight], lr=ssl_embed_lr,
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+        )
+        ssl_opt_conv = torch.optim.Adam(
+            ssl_conv.parameters(), lr=args.ssl_conv_lr,
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+        )
+
+        base_model.train()
+
+        for ssl_step in range(args.ssl_steps):
+            ssl_opt_embed.zero_grad(set_to_none=True)
+            ssl_opt_conv.zero_grad(set_to_none=True)
+
+            x, _ = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                emb = base_model.tok_emb(x)
+                emb_normed = F.rms_norm(emb, (emb.size(-1),))
+                pred = ssl_conv(emb_normed)
+                target = emb_normed[:, 1:, :].detach()
+                pred = pred[:, :-1, :]
+                # Cosine similarity loss: 1 - cos_sim
+                pred_norm = F.normalize(pred, dim=-1)
+                target_norm = F.normalize(target, dim=-1)
+                ssl_loss = (1.0 - (pred_norm * target_norm).sum(dim=-1)).mean()
+
+            ssl_loss.backward()
+            ssl_opt_embed.step()
+            ssl_opt_conv.step()
+
+            if ssl_step == 0 or (ssl_step + 1) % 20 == 0 or ssl_step + 1 == args.ssl_steps:
+                log0(f"ssl_step:{ssl_step + 1}/{args.ssl_steps} ssl_loss:{ssl_loss.item():.4f}")
+
+        # Transfer embedding optimizer state to main optimizer
+        emb_param = base_model.tok_emb.weight
+        if emb_param in ssl_opt_embed.state:
+            ssl_state = ssl_opt_embed.state[emb_param]
+            # Scale the optimizer state moments since main optimizer uses different LR
+            main_state = optimizer_tok.state.get(emb_param, {})
+            main_state['step'] = ssl_state['step'].clone()
+            main_state['exp_avg'] = ssl_state['exp_avg'].clone()
+            main_state['exp_avg_sq'] = ssl_state['exp_avg_sq'].clone()
+            optimizer_tok.state[emb_param] = main_state
+
+        del ssl_conv, ssl_norm, ssl_opt_embed, ssl_opt_conv, ssl_loss
+        torch.cuda.empty_cache()
+
+        _t_ssl_end = time.perf_counter()
+        log0(f"TIMING ssl_pretrain:{(_t_ssl_end-_t_ssl_start)*1000:.0f}ms ({args.ssl_steps} steps)")
+
+        # Reset the data loader so main training starts from the beginning
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # -----------------------------
+    # DATA LOADER & MODEL WARMUP
+    # -----------------------------
 
     def zero_grad_all() -> None:
         for opt in optimizers:
