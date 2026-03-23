@@ -91,6 +91,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    l1_decay = float(os.environ.get("L1_DECAY", 0.01))
+    laplace_init = bool(int(os.environ.get("LAPLACE_INIT", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -665,6 +667,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        laplace_init: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -672,6 +675,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.laplace_init = laplace_init
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -694,14 +698,26 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self._init_weights()
+        self._init_weights(laplace=self.laplace_init)
 
-    def _init_weights(self) -> None:
+    def _init_weights(self, laplace: bool = True, trunc: float = 2.0) -> None:
         if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+            if laplace:
+                b = self.tied_embed_init_std / math.sqrt(2)
+                w = torch.distributions.Laplace(0, b).sample(self.tok_emb.weight.shape)
+                w.clamp_(-trunc * b, trunc * b)
+                self.tok_emb.weight.data.copy_(w)
+            else:
+                nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            elif isinstance(module, nn.Linear) and laplace:
+                fan_in = module.weight.size(1)
+                b = 1.0 / math.sqrt(6.0 * fan_in)
+                w = torch.distributions.Laplace(0, b).sample(module.weight.shape)
+                w.clamp_(-trunc * b, trunc * b)
+                module.weight.data.copy_(w)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -842,6 +858,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        laplace_init=args.laplace_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1053,6 +1070,13 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        # L1 weight decay: w -= lr * d * sign(w), applied to matrix params only
+        if args.l1_decay > 0:
+            with torch.no_grad():
+                for group in optimizer_muon.param_groups:
+                    lr = group["lr"]
+                    for p in group["params"]:
+                        p.add_(p.sign(), alpha=-lr * args.l1_decay)
         zero_grad_all()
 
         step += 1

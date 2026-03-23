@@ -50,6 +50,8 @@ All experiments run on 2026-03-18/19, comparing against the 9L/512d tied-embeddi
 | 11 | Canon v1 (pre-act, k4) | canon-layers | 1.2840 | +0.0551 | 2416 | 15.5MB | 75ms/step, wrong placement |
 | — | | | | | | | |
 | 18 | SPlus optimizer (SVD eigenbasis) | worktree-svdopt | — | — | — | — | 10-min run in progress |
+| 19 | L1 decay 0.01 + normal init | worktree-l1 | 1.3539* | +0.0920* | ~3926 | 8.0MB | **Negative** — L1 decay hurts with Muon |
+| 20 | Truncated Laplace init (±2b), no decay | worktree-l1 | 1.3407* | +0.0788* | ~3926 | 8.0MB | **Negative** — heavier tails hurt |
 
 ---
 
@@ -172,6 +174,19 @@ Key changes:
 - Default LR raised to 0.2 (from Muon's 0.04), removed momentum warmup
 
 10-min run in progress. Large refactor (107 insertions, 86 deletions).
+
+### 11. L1 Weight Decay + Laplace Initialization (worktree-l1)
+Replaced L2-implicit Gaussian prior with L1 decay (`lr * d * sign(w)`) and variance-matched Laplace initialization (`b = 1/√(6·fan_in)`).
+
+Isolated ablation (3-min runs*):
+| Config | val_bpb | Δ vs 3-min baseline |
+|--------|---------|---------------------|
+| Laplace init + L1=0.01 | 1.3315 | +0.0696 |
+| Laplace init + L1=0.001 | 1.3310 | +0.0691 |
+| Truncated Laplace (±2b), no decay | 1.3407 | +0.0788 |
+| Normal init + L1=0.01 | 1.3539 | +0.0920 |
+
+Both components hurt independently. Laplace's excess kurtosis (3 vs -1.2 for uniform) likely worsens conditioning. L1 decay conflicts with Muon's orthogonalization. No 10-min run warranted.
 
 ---
 
